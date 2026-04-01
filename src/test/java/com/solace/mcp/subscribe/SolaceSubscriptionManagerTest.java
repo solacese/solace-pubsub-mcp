@@ -37,4 +37,17 @@ class SolaceSubscriptionManagerTest {
     void emptyTopicDoesNotMatch() {
         assertThat(SolaceSubscriptionManager.topicMatchesSubscription("", "a/*")).isFalse();
     }
+
+    @Test
+    void resourceUriFormat() {
+        assertThat(SolaceSubscriptionManager.resourceUri("sub-123"))
+                .isEqualTo("solace://subscriptions/sub-123/messages");
+    }
+
+    @Test
+    void resourceUriPrefixAndSuffixConsistent() {
+        String uri = SolaceSubscriptionManager.resourceUri("abc");
+        assertThat(uri).startsWith(SolaceSubscriptionManager.RESOURCE_URI_PREFIX);
+        assertThat(uri).endsWith(SolaceSubscriptionManager.RESOURCE_URI_SUFFIX);
+    }
 }

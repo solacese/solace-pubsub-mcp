@@ -93,9 +93,13 @@ public final class SolacePubSubMcpServer {
                 .serverInfo(SERVER_NAME, SERVER_VERSION)
                 .capabilities(McpSchema.ServerCapabilities.builder()
                         .tools(true)
+                        .resources(true, true)   // enable resources with subscribe + listChanged
                         .logging()
                         .build())
                 .build();
+
+        // Wire the MCP server into the subscription manager for resource notifications
+        subscriptionManager.setMcpServer(mcpServer);
 
         // Register tools
         McpToolHandlers toolHandlers = new McpToolHandlers(

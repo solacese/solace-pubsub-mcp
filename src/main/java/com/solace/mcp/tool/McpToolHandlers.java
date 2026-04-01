@@ -116,7 +116,7 @@ public final class McpToolHandlers {
         return McpServerFeatures.SyncToolSpecification.builder()
                 .tool(Tool.builder()
                         .name("subscribe_topic")
-                        .description("Subscribe to a Solace PubSub+ topic. Messages are buffered and retrieved via receive_messages.")
+                        .description("Subscribe to a Solace PubSub+ topic. Messages are delivered via resource notifications (solace://subscriptions/{id}/messages) and can also be polled via receive_messages.")
                         .inputSchema(parseSchema(schema))
                         .build())
                 .callHandler((exchange, request) -> {

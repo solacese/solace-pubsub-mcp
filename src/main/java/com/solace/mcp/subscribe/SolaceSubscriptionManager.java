@@ -8,6 +8,9 @@ import com.solace.mcp.metrics.MetricsService;
 import com.solace.mcp.model.*;
 import com.solace.mcp.policy.TopicPolicyEngine;
 import com.solacesystems.jcsmp.*;
+import io.modelcontextprotocol.server.McpServerFeatures;
+import io.modelcontextprotocol.server.McpSyncServer;
+import io.modelcontextprotocol.spec.McpSchema;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -18,17 +21,30 @@ import java.util.concurrent.ConcurrentHashMap;
 /**
  * Manages session-scoped topic subscriptions with bounded per-subscription buffers.
  *
- * Subscription delivery model:
- * - Each subscription has a bounded ArrayBlockingQueue buffer.
- * - Inbound messages are dispatched to matching subscriptions by topic.
- * - MCP clients poll for messages via the receive_messages tool.
- * - On buffer overflow, the oldest message is dropped (drop-head policy).
- * - Subscriptions are ephemeral and do not survive server restart.
- * - On broker reconnect, JCSMP reapplies subscriptions automatically (REAPPLY_SUBSCRIPTIONS=true).
+ * Subscription delivery model (dual-path):
+ *
+ * 1. PUSH (resource notifications):
+ *    When a message arrives from the broker, the server fires
+ *    notifications/resources/updated for the subscription's resource URI.
+ *    The MCP client receives the notification and reads the resource to get messages.
+ *    Latency ≈ MCP notification round-trip.
+ *
+ * 2. POLL (receive_messages tool):
+ *    The client can also explicitly poll buffered messages at any time.
+ *    Both paths coexist — the push notification triggers the client to read,
+ *    while poll works for clients that don't support resource subscriptions.
+ *
+ * Each subscription has a bounded ArrayBlockingQueue buffer.
+ * On buffer overflow, the oldest message is dropped (drop-head policy).
+ * Subscriptions are ephemeral and do not survive server restart.
+ * On broker reconnect, JCSMP reapplies subscriptions automatically (REAPPLY_SUBSCRIPTIONS=true).
  */
 public class SolaceSubscriptionManager implements XMLMessageListener {
 
     private static final Logger log = LoggerFactory.getLogger(SolaceSubscriptionManager.class);
+
+    public static final String RESOURCE_URI_PREFIX = "solace://subscriptions/";
+    public static final String RESOURCE_URI_SUFFIX = "/messages";
 
     private final BrokerConnectionManager connectionManager;
     private final TopicPolicyEngine policyEngine;
@@ -37,10 +53,10 @@ public class SolaceSubscriptionManager implements XMLMessageListener {
     private final int maxBufferPerSubscription;
 
     private final ConcurrentHashMap<String, SubscriptionEntry> subscriptions = new ConcurrentHashMap<>();
-    // Maps Solace topic string to subscription IDs for message routing
     private final ConcurrentHashMap<String, Set<String>> topicToSubscriptionIds = new ConcurrentHashMap<>();
 
     private volatile XMLMessageConsumer consumer;
+    private volatile McpSyncServer mcpServer;
 
     public SolaceSubscriptionManager(
             BrokerConnectionManager connectionManager,
@@ -52,6 +68,14 @@ public class SolaceSubscriptionManager implements XMLMessageListener {
         this.metrics = metrics;
         this.maxActiveSubscriptions = limits.maxActiveSubscriptions();
         this.maxBufferPerSubscription = limits.maxBufferPerSubscription();
+    }
+
+    /**
+     * Sets the MCP server reference so we can fire resource-updated notifications.
+     * Must be called after the MCP server is built but before messages arrive.
+     */
+    public void setMcpServer(McpSyncServer mcpServer) {
+        this.mcpServer = mcpServer;
     }
 
     public void init() {
@@ -103,14 +127,18 @@ public class SolaceSubscriptionManager implements XMLMessageListener {
             metrics.incrementActiveSubscriptions();
             connectionManager.recordSuccessfulInteraction();
 
-            log.info("Subscribed to topic '{}', subscriptionId={}", request.topic(), subscriptionId);
+            // Register a dynamic MCP resource for this subscription
+            registerSubscriptionResource(subscriptionId, request.topic());
+
+            log.info("Subscribed to topic '{}', subscriptionId={}, resourceUri={}",
+                    request.topic(), subscriptionId, resourceUri(subscriptionId));
 
             return new SubscribeResult(
                     true,
                     subscriptionId,
                     request.topic(),
                     entry.createdAt(),
-                    "bounded-buffer, capacity=%d, overflow=drop-oldest".formatted(maxBufferPerSubscription)
+                    "bounded-buffer, capacity=%d, overflow=drop-oldest, push=resource-notification".formatted(maxBufferPerSubscription)
             );
         } catch (JCSMPException e) {
             throw new SubscriptionException(
@@ -135,7 +163,6 @@ public class SolaceSubscriptionManager implements XMLMessageListener {
             }
         }
 
-        // Only remove the broker subscription if no other subscription entries use the same topic
         boolean otherSubscriptionsExist = subscriptions.values().stream()
                 .anyMatch(e -> e.topic().equals(entry.topic()));
 
@@ -148,6 +175,9 @@ public class SolaceSubscriptionManager implements XMLMessageListener {
                         entry.topic(), e.getMessage());
             }
         }
+
+        // Remove the dynamic MCP resource
+        removeSubscriptionResource(subscriptionId);
 
         metrics.decrementActiveSubscriptions();
         connectionManager.recordSuccessfulInteraction();
@@ -184,6 +214,16 @@ public class SolaceSubscriptionManager implements XMLMessageListener {
                 messages,
                 entry.bufferedCount()
         );
+    }
+
+    /**
+     * Reads buffered messages for a subscription. Used by the MCP resource read handler.
+     * This is the same as receiveMessages but called via the resource path.
+     */
+    public List<InboundMessage> readMessagesForResource(String subscriptionId) {
+        SubscriptionEntry entry = subscriptions.get(subscriptionId);
+        if (entry == null) return List.of();
+        return entry.drain(100);
     }
 
     public List<SubscriptionInfo> listSubscriptions() {
@@ -231,8 +271,6 @@ public class SolaceSubscriptionManager implements XMLMessageListener {
             }
         }
 
-        // Route to all matching subscriptions
-        // Use direct topic match first, then check wildcard subscriptions
         routeMessage(topic, payload, message.getHTTPContentType(), message.getCorrelationId(),
                 properties, receivedAt);
     }
@@ -258,6 +296,9 @@ public class SolaceSubscriptionManager implements XMLMessageListener {
                             entry.subscriptionId(), topic);
                 }
                 routed = true;
+
+                // Fire resource-updated notification to MCP client
+                notifyResourceUpdated(entry.subscriptionId());
             }
         }
 
@@ -267,9 +308,128 @@ public class SolaceSubscriptionManager implements XMLMessageListener {
     }
 
     /**
-     * Checks if a concrete topic matches a subscription pattern.
-     * Handles Solace wildcards: * = single level, > = one or more trailing levels.
+     * Sends a notifications/resources/updated to the MCP client so it knows
+     * new messages are available on this subscription's resource.
      */
+    private void notifyResourceUpdated(String subscriptionId) {
+        McpSyncServer server = this.mcpServer;
+        if (server == null) return;
+
+        try {
+            server.notifyResourcesUpdated(
+                    new McpSchema.ResourcesUpdatedNotification(resourceUri(subscriptionId), null));
+            log.trace("Sent resource-updated notification for subscription '{}'", subscriptionId);
+        } catch (Exception e) {
+            // Non-fatal: client may not support resource subscriptions
+            log.debug("Failed to send resource-updated notification for '{}': {}",
+                    subscriptionId, e.getMessage());
+        }
+    }
+
+    /**
+     * Registers a dynamic MCP resource for a subscription so clients can
+     * subscribe to resource updates and read messages via resources/read.
+     */
+    private void registerSubscriptionResource(String subscriptionId, String topicPattern) {
+        McpSyncServer server = this.mcpServer;
+        if (server == null) return;
+
+        try {
+            var resource = McpSchema.Resource.builder()
+                    .uri(resourceUri(subscriptionId))
+                    .name("Subscription: " + topicPattern)
+                    .description("Buffered messages for subscription " + subscriptionId + " on topic " + topicPattern)
+                    .mimeType("application/json")
+                    .build();
+
+            var spec = new McpServerFeatures.SyncResourceSpecification(
+                    resource,
+                    (exchange, request) -> {
+                        List<InboundMessage> messages = readMessagesForResource(subscriptionId);
+                        String json = serializeMessages(messages);
+                        return new McpSchema.ReadResourceResult(
+                                List.of(new McpSchema.TextResourceContents(
+                                        request.uri(), "application/json", json, null)),
+                                null);
+                    });
+
+            server.addResource(spec);
+            server.notifyResourcesListChanged();
+            log.debug("Registered MCP resource for subscription '{}'", subscriptionId);
+        } catch (Exception e) {
+            log.warn("Failed to register MCP resource for subscription '{}': {}",
+                    subscriptionId, e.getMessage());
+        }
+    }
+
+    /**
+     * Removes the dynamic MCP resource when a subscription is cancelled.
+     */
+    private void removeSubscriptionResource(String subscriptionId) {
+        McpSyncServer server = this.mcpServer;
+        if (server == null) return;
+
+        try {
+            server.removeResource(resourceUri(subscriptionId));
+            server.notifyResourcesListChanged();
+            log.debug("Removed MCP resource for subscription '{}'", subscriptionId);
+        } catch (Exception e) {
+            log.debug("Failed to remove MCP resource for subscription '{}': {}",
+                    subscriptionId, e.getMessage());
+        }
+    }
+
+    private String serializeMessages(List<InboundMessage> messages) {
+        // Simple JSON array serialization without pulling in ObjectMapper dependency
+        if (messages.isEmpty()) return "[]";
+        var sb = new StringBuilder("[");
+        for (int i = 0; i < messages.size(); i++) {
+            if (i > 0) sb.append(",");
+            var m = messages.get(i);
+            sb.append("{\"subscriptionId\":\"").append(escape(m.subscriptionId())).append("\"");
+            sb.append(",\"topic\":\"").append(escape(m.topic())).append("\"");
+            sb.append(",\"payload\":").append(payloadToJson(m.payload()));
+            if (m.contentType() != null) {
+                sb.append(",\"contentType\":\"").append(escape(m.contentType())).append("\"");
+            }
+            if (m.correlationId() != null) {
+                sb.append(",\"correlationId\":\"").append(escape(m.correlationId())).append("\"");
+            }
+            if (m.properties() != null && !m.properties().isEmpty()) {
+                sb.append(",\"properties\":{");
+                int j = 0;
+                for (var entry : m.properties().entrySet()) {
+                    if (j++ > 0) sb.append(",");
+                    sb.append("\"").append(escape(entry.getKey())).append("\":\"").append(escape(entry.getValue())).append("\"");
+                }
+                sb.append("}");
+            }
+            sb.append(",\"receivedAt\":\"").append(m.receivedAt()).append("\"");
+            sb.append("}");
+        }
+        sb.append("]");
+        return sb.toString();
+    }
+
+    private static String payloadToJson(Object payload) {
+        if (payload == null) return "null";
+        String s = payload.toString();
+        // If it looks like JSON object/array, pass through directly
+        if ((s.startsWith("{") && s.endsWith("}")) || (s.startsWith("[") && s.endsWith("]"))) {
+            return s;
+        }
+        return "\"" + escape(s) + "\"";
+    }
+
+    private static String escape(String s) {
+        if (s == null) return "";
+        return s.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r");
+    }
+
+    static String resourceUri(String subscriptionId) {
+        return RESOURCE_URI_PREFIX + subscriptionId + RESOURCE_URI_SUFFIX;
+    }
+
     static boolean topicMatchesSubscription(String topic, String subscriptionPattern) {
         if (topic.equals(subscriptionPattern)) return true;
 

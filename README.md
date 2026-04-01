@@ -52,11 +52,32 @@ It is not a broker admin platform. It does not expose queue provisioning, ACL ma
 
 ### Subscription delivery model
 
-Subscriptions are **session-scoped and ephemeral**. Each subscription gets a bounded `ArrayBlockingQueue` buffer. Inbound messages are routed by topic matching (including Solace wildcards `*` and `>`). MCP clients retrieve messages by calling the `receive_messages` tool with the subscription ID.
+Subscriptions are **session-scoped and ephemeral**. Each subscription gets a bounded `ArrayBlockingQueue` buffer. Inbound messages are routed by topic matching (including Solace wildcards `*` and `>`).
+
+**Dual delivery paths:**
+
+1. **Push (resource notifications)** — When a message arrives, the server sends a `notifications/resources/updated` notification for the subscription's resource URI (`solace://subscriptions/{id}/messages`). The MCP client receives the notification and reads the resource to get messages. Latency = MCP notification round-trip.
+
+2. **Poll (receive_messages tool)** — The client can also explicitly poll buffered messages at any time. Both paths coexist.
+
+```
+Client                          MCP Server                      Solace Broker
+  │                                │                                │
+  │─── subscribe_topic("orders/*") ──►│                                │
+  │◄── subscriptionId: sub-123 ────│── addSubscription ──────────────►│
+  │                                │                                │
+  │─── resources/subscribe ────────►│                                │
+  │    uri: solace://sub-123/msgs  │                                │
+  │                                │◄───── message on orders/new ───│
+  │◄── notification/resources/ ────│  (buffered)                    │
+  │    updated: solace://sub-123   │                                │
+  │─── resources/read ─────────────►│                                │
+  │◄── [{topic, payload, ...}] ────│                                │
+```
 
 - **Overflow policy**: drop-oldest (the oldest buffered message is discarded to make room)
 - **Reconnect**: JCSMP reapplies subscriptions automatically (`REAPPLY_SUBSCRIPTIONS=true`)
-- **Cleanup**: subscriptions are removed on unsubscribe or server shutdown
+- **Cleanup**: subscriptions and their resources are removed on unsubscribe or server shutdown
 
 ## Tools
 
@@ -263,7 +284,7 @@ Add to `.claude/settings.json`:
 - **STDIO transport only** — SSE/HTTP transport can be added later
 - **No durable subscriptions** — session-scoped only (by design for safety)
 - **No queue consumption** — direct topic subscriptions only
-- **Poll-based message delivery** — MCP's sync request/response model doesn't support server-push; clients call `receive_messages` to retrieve buffered messages
+- **Resource notification support varies** — Push delivery via `notifications/resources/updated` requires the MCP client to support resource subscriptions. Clients without support fall back to polling via `receive_messages`
 - **Single broker connection** — no multi-broker fan-out
 
 ## Future extensions
