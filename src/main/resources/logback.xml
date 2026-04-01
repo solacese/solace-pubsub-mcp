@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+    <property name="LOG_PATTERN" value="%d{ISO8601} [%thread] %-5level %logger{36} - %msg%n"/>
+
+    <!-- Log to stderr so stdout stays clean for MCP STDIO transport -->
+    <appender name="STDERR" class="ch.qos.logback.core.ConsoleAppender">
+        <target>System.err</target>
+        <encoder>
+            <pattern>${LOG_PATTERN}</pattern>
+        </encoder>
+    </appender>
+
+    <logger name="com.solace.mcp" level="${SOLACE_MCP_LOG_LEVEL:-INFO}"/>
+    <logger name="com.solacesystems" level="WARN"/>
+    <logger name="io.modelcontextprotocol" level="WARN"/>
+
+    <root level="WARN">
+        <appender-ref ref="STDERR"/>
+    </root>
+</configuration>

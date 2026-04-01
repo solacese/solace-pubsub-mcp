@@ -1,0 +1,33 @@
+version: "3.8"
+
+services:
+  solace:
+    image: solace/solace-pubsub-standard:latest
+    container_name: solace-broker
+    ports:
+      - "8080:8080"    # SEMP / management
+      - "55555:55555"  # SMF
+      - "55443:55443"  # SMF over TLS
+      - "55554:55554"  # Web transport
+    environment:
+      - username_admin_globalaccesslevel=admin
+      - username_admin_password=admin
+      - system_scaling_maxconnectioncount=100
+    shm_size: 1g
+    ulimits:
+      nofile:
+        soft: 2448
+        hard: 6592
+
+  # Uncomment to run the MCP server alongside the broker:
+  # solace-mcp:
+  #   build: .
+  #   container_name: solace-pubsub-mcp
+  #   depends_on:
+  #     - solace
+  #   environment:
+  #     SOLACE_HOST: tcp://solace:55555
+  #     SOLACE_VPN: default
+  #     SOLACE_USERNAME: default
+  #     SOLACE_PASSWORD: default
+  #   stdin_open: true
